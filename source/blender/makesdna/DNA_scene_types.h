@@ -1388,7 +1388,8 @@ typedef struct ToolSettings {
   char uv_selectmode;
 
   float uvcalc_margin;
-
+  int lol;
+  int _padx[3];
   /* Auto-IK */
   /** Runtime only. */
   short autoik_chainlen;
