@@ -1036,7 +1036,6 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
     RNA_float_set(op->ptr, "margin", scene->toolsettings->uvcalc_margin);
   }
 
-  printf("aasjdkasdasjdalskdjalskd");
   ED_uvedit_pack_islands_multi(scene,
                                objects,
                                objects_len,
