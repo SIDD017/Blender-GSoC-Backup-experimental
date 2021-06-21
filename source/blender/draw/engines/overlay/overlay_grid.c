@@ -74,7 +74,6 @@ void OVERLAY_grid_init(OVERLAY_Data *vedata)
   View3D *v3d = draw_ctx->v3d;
   Scene *scene = draw_ctx->scene;
   RegionView3D *rv3d = draw_ctx->rv3d;
-  float tes;
 
   const bool show_axis_x = (pd->v3d_gridflag & V3D_SHOW_X) != 0;
   const bool show_axis_y = (pd->v3d_gridflag & V3D_SHOW_Y) != 0;
