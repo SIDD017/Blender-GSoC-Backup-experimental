@@ -755,7 +755,9 @@ int BKE_image_find_nearest_tile(const Image *image, const float co[2])
       return tile->tile_number;
     }
 
-    /* Distance between co[2] and UDIM tile. */
+    /* Distance between co[2] and center of UDIM tile. */
+    tile_index_co[0] += 0.5f;
+    tile_index_co[1] += 0.5f;
     const float dist_sq = len_squared_v2v2(tile_index_co, co);
 
     if (dist_sq < dist_best_sq) {

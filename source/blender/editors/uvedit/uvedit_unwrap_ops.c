@@ -37,6 +37,7 @@
 #include "BLI_alloca.h"
 #include "BLI_array.h"
 #include "BLI_linklist.h"
+#include "BLI_listbase.h"
 #include "BLI_math.h"
 #include "BLI_memarena.h"
 #include "BLI_string.h"
@@ -64,6 +65,7 @@
 #include "PIL_time.h"
 
 #include "UI_interface.h"
+#include "UI_view2d.h"
 
 #include "ED_image.h"
 #include "ED_mesh.h"
@@ -1009,6 +1011,11 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
 {
   ViewLayer *view_layer = CTX_data_view_layer(C);
   const Scene *scene = CTX_data_scene(C);
+  const SpaceImage *sima = CTX_wm_space_image(C);
+
+  const Image *image = sima->image;
+  const bool is_tiled_image = image && (image->source == IMA_SRC_TILED);
+  bool use_target = false;
 
   const UnwrapOptions options = {
       .topology_from_uvs = true,
@@ -1019,6 +1026,57 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
   };
 
   bool rotate = RNA_boolean_get(op->ptr, "rotate");
+
+  /* Check if specified UDIM is valid - specified tile exists in the udim grid or tiled image */
+  if (RNA_enum_get(op->ptr, "packTo") == 1) {
+    if (RNA_struct_property_is_set(op->ptr, "target_udim")) {
+      int target_udim = RNA_int_get(op->ptr, "target_udim");
+
+      /* If no image in the UV editor then check if target_UDIM lies within the UDIM grid*/
+      if (!image) {
+        target_udim -= 1001;
+        const int target_x = (target_udim % 10) + 1;
+        const int target_y = (target_udim / 10) + 1;
+
+        if (target_x <= sima->tile_grid_shape[0] && target_y <= sima->tile_grid_shape[1]) {
+          scene->toolsettings->target_udim = RNA_int_get(op->ptr, "target_udim");
+        }
+        else {
+          RNA_int_set(op->ptr, "target_udim", scene->toolsettings->target_udim);
+        }
+      }
+
+      /* If tiled image present then check if target_udim is valid */
+      else if (image && is_tiled_image) {
+        RNA_int_set(op->ptr, "target_udim", scene->toolsettings->target_udim);
+
+        LISTBASE_FOREACH (const ImageTile *, tile, &image->tiles) {
+
+          if (target_udim == tile->tile_number) {
+            scene->toolsettings->target_udim = target_udim;
+            RNA_int_set(op->ptr, "target_udim", target_udim);
+            break;
+          }
+        }
+      }
+
+      /* If non-tiled image present then always pack to UDIM 1001 */
+      else if (image && !is_tiled_image) {
+        scene->toolsettings->target_udim = 1001;
+        RNA_int_set(op->ptr, "target_udim", 1001);
+      }
+    }
+
+    /*  */
+    else {
+      scene->toolsettings->target_udim = RNA_int_get(op->ptr, "target_udim");
+    }
+    use_target = true;
+  }
+
+  else {
+    use_target = false;
+  }
 
   uint objects_len = 0;
   Object **objects = BKE_view_layer_array_from_objects_in_edit_mode_unique_data_with_uvs(
@@ -1039,6 +1097,8 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
   ED_uvedit_pack_islands_multi(scene,
                                objects,
                                objects_len,
+                               sima,
+                               use_target,
                                &(struct UVPackIsland_Params){
                                    .rotate = rotate,
                                    .rotate_align_axis = -1,
@@ -1052,8 +1112,32 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
   return OPERATOR_FINISHED;
 }
 
+static void pack_islands_draw(bContext *C, wmOperator *op)
+{
+  uiLayout *layout = op->layout;
+  uiLayout *col;
+
+  uiLayoutSetPropSep(layout, true);
+  uiLayoutSetPropDecorate(layout, false);
+
+  col = uiLayoutColumn(layout, false);
+
+  uiItemR(col, op->ptr, "packTo", 0, NULL, 0);
+  if (RNA_enum_get(op->ptr, "packTo") == 1) {
+    uiItemR(col, op->ptr, "target_udim", 0, NULL, 0);
+  }
+
+  uiItemR(col, op->ptr, "rotate", 0, NULL, 0);
+  uiItemR(col, op->ptr, "margin", 0, NULL, 0);
+}
+
 void UV_OT_pack_islands(wmOperatorType *ot)
 {
+  static const EnumPropertyItem pack_to[] = {
+      {0, "CLOSEST_UDIM", 0, "Closest UDIM", "Pack islands to closest UDIM"},
+      {1, "SPECIFIED_UDIM", 0, "Specified UDIM", "Pack islands to specified UDIM"},
+      {0, NULL, 0, NULL, NULL},
+  };
   /* identifiers */
   ot->name = "Pack Islands";
   ot->idname = "UV_OT_pack_islands";
@@ -1064,11 +1148,145 @@ void UV_OT_pack_islands(wmOperatorType *ot)
   /* api callbacks */
   ot->exec = pack_islands_exec;
   ot->poll = ED_operator_uvedit;
+  ot->ui = pack_islands_draw;
 
   /* properties */
+  RNA_def_enum(ot->srna, "packTo", pack_to, 0, "Pack to", "");
   RNA_def_boolean(ot->srna, "rotate", true, "Rotate", "Rotate islands for best fit");
+  RNA_def_int(ot->srna,
+              "target_udim",
+              1001,
+              1001,
+              1100,
+              "Target UDIM",
+              "Pack islands to target UDIM",
+              1001,
+              1100);
   RNA_def_float_factor(
       ot->srna, "margin", 0.001f, 0.0f, 1.0f, "Margin", "Space between islands", 0.0f, 1.0f);
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Pack islands to area Operator
+ * \{ */
+
+static int pack_islands_to_area_exec(bContext *C, wmOperator *op)
+{
+  ViewLayer *view_layer = CTX_data_view_layer(C);
+  const Scene *scene = CTX_data_scene(C);
+  ARegion *region = CTX_wm_region(C);
+
+  uint objects_len = 0;
+  /* Get reference to objects currently in edit mode */
+  Object **objects = BKE_view_layer_array_from_objects_in_edit_mode_unique_data_with_uvs(
+      view_layer, CTX_wm_view3d(C), &objects_len);
+
+  /* User-defined area for packing */
+  rctf bounds;
+  WM_operator_properties_border_to_rctf(op, &bounds);
+  UI_view2d_region_to_view_rctf(&region->v2d, &bounds, &bounds);
+
+  /* Store the bounding coordinates for the user-defined area */
+  float min_co[2] = {bounds.xmin, bounds.ymin};
+  float max_co[2] = {bounds.xmax, bounds.ymax};
+
+  /* Keeping a lower bound of 0.001 for user-defined space, smaller than that and the UVs won't be
+   * visible in the UV editor
+   * NOTE : Could be removed/changed */
+  if ((max_co[0] - min_co[0]) <= 0.001 || (max_co[1] - min_co[1]) <= 0.001) {
+    return OPERATOR_CANCELLED;
+  }
+
+  /* Check : packing area coordinates */
+  printf("Bottom-left coordinates : (%f,%f) \n", bounds.xmin, bounds.ymin);
+  printf("Top-right coordinates : (%f,%f) \n\n", bounds.xmax, bounds.ymax);
+
+  /* RNA props */
+  bool rotate_islands = RNA_boolean_get(op->ptr, "rotate");
+  bool scale_islands = RNA_boolean_get(op->ptr, "scale");
+  if (RNA_struct_property_is_set(op->ptr, "margin")) {
+    scene->toolsettings->uvcalc_margin = RNA_float_get(op->ptr, "margin");
+  }
+  else {
+    RNA_float_set(op->ptr, "margin", scene->toolsettings->uvcalc_margin);
+  }
+
+  ED_uvedit_pack_islands_to_area_multi(scene,
+                                       objects,
+                                       objects_len,
+                                       min_co,
+                                       max_co,
+                                       scale_islands,
+                                       &(struct UVPackIsland_Params){
+                                           .rotate = rotate_islands,
+                                           .rotate_align_axis = -1,
+                                           .only_selected_uvs = true,
+                                           .only_selected_faces = true,
+                                           .correct_aspect = true,
+                                       });
+
+  MEM_freeN(objects);
+  return OPERATOR_FINISHED;
+}
+
+static int pack_islands_to_area_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+{
+  /* Check if any UVs are selected in the UV editor before calling WM_gesture_box_invoke() */
+  ViewLayer *view_layer = CTX_data_view_layer(C);
+  const Scene *scene = CTX_data_scene(C);
+
+  uint objects_len = 0;
+  /* Get reference to objects currently in edit mode */
+  Object **objects = BKE_view_layer_array_from_objects_in_edit_mode_unique_data_with_uvs(
+      view_layer, CTX_wm_view3d(C), &objects_len);
+
+  const UnwrapOptions options = {
+      .topology_from_uvs = true,
+      .only_selected_faces = true,
+      .only_selected_uvs = true,
+      .fill_holes = false,
+      .correct_aspect = false,
+  };
+
+  /* If no islands selected then cancel operator */
+  if (!uvedit_have_selection_multi(scene, objects, objects_len, &options)) {
+    MEM_freeN(objects);
+    return OPERATOR_CANCELLED;
+  }
+
+  /* Free memory before running invoke */
+  MEM_freeN(objects);
+  return WM_gesture_box_invoke(C, op, event);
+}
+
+void UV_OT_pack_islands_to_area(wmOperatorType *ot)
+{
+  /* identifiers */
+  ot->name = "Pack Islands to area";
+  ot->idname = "UV_OT_pack_islands_to_area";
+  ot->description = "Transform selected islands so that they fill up specified area in UV space";
+
+  /* api callbacks */
+  ot->invoke = pack_islands_to_area_invoke;
+  ot->exec = pack_islands_to_area_exec;
+  ot->modal = WM_gesture_box_modal;
+  ot->cancel = WM_gesture_box_cancel;
+
+  ot->poll = ED_operator_uvedit;
+  // ot->poll = ED_operator_uvedit_space_image;
+
+  /* flags */
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+
+  /* RNA properties */
+  RNA_def_boolean(ot->srna, "rotate", true, "Rotate", "Rotate islands for best fit");
+  RNA_def_boolean(ot->srna, "scale", true, "Scale", "Scale islands for best fit");
+  RNA_def_float_factor(
+      ot->srna, "margin", 0.001f, 0.0f, 1.0f, "Margin", "Space between islands", 0.0f, 1.0f);
+
+  WM_operator_properties_border(ot);
 }
 
 /** \} */
@@ -2206,6 +2424,8 @@ static int smart_project_exec(bContext *C, wmOperator *op)
     ED_uvedit_pack_islands_multi(scene,
                                  objects_changed,
                                  object_changed_len,
+                                 NULL,
+                                 false,
                                  &(struct UVPackIsland_Params){
                                      .rotate = true,
                                      /* We could make this optional. */

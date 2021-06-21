@@ -29,6 +29,7 @@
 
 #include "DNA_meshdata_types.h"
 #include "DNA_scene_types.h"
+#include "DNA_space_types.h"
 
 #include "BLI_boxpack_2d.h"
 #include "BLI_convexhull_2d.h"
@@ -37,6 +38,7 @@
 #include "BLI_rect.h"
 
 #include "BKE_editmesh.h"
+#include "BKE_image.h"
 
 #include "DEG_depsgraph.h"
 
@@ -358,12 +360,26 @@ static int bm_mesh_calc_uv_islands(const Scene *scene,
 void ED_uvedit_pack_islands_multi(const Scene *scene,
                                   Object **objects,
                                   const uint objects_len,
+                                  const SpaceImage *sima,
+                                  bool use_target,
                                   const struct UVPackIsland_Params *params)
 {
   /* Align to the Y axis, could make this configurable. */
   const int rotate_align_axis = 1;
   ListBase island_list = {NULL};
   int island_list_len = 0;
+
+  const Image *image;
+  bool is_tiled_image = false;
+  int udim_grid[2] = {1, 1};
+
+  /* To handle cases where sima=NULL - Smart UV project */
+  if (sima) {
+    image = sima->image;
+    is_tiled_image = image && (image->source == IMA_SRC_TILED);
+    udim_grid[0] = sima->tile_grid_shape[0];
+    udim_grid[1] = sima->tile_grid_shape[1];
+  }
 
   for (uint ob_index = 0; ob_index < objects_len; ob_index++) {
     Object *obedit = objects[ob_index];
@@ -406,7 +422,25 @@ void ED_uvedit_pack_islands_multi(const Scene *scene,
   BoxPack *boxarray = MEM_mallocN(sizeof(*boxarray) * island_list_len, __func__);
 
   int index;
+  /* Coordinates for the center of the all the selected islands */
+  float selection_center[2] = {0.0f, 0.0f};
+  float selection_min[2], selection_max[2];
+  INIT_MINMAX2(selection_min, selection_max);
+
   LISTBASE_FOREACH_INDEX (struct FaceIsland *, island, &island_list, index) {
+
+    /* Calculate bounding box of all selected islands */
+    float bounds_min[2], bounds_max[2];
+    INIT_MINMAX2(bounds_min, bounds_max);
+    for (int i = 0; i < island->faces_len; i++) {
+      BMFace *f = island->faces[i];
+      BM_face_uv_minmax(f, bounds_min, bounds_max, island->cd_loop_uv_offset);
+    }
+
+    selection_min[0] = MIN2(bounds_min[0], selection_min[0]);
+    selection_min[1] = MIN2(bounds_min[1], selection_min[1]);
+    selection_max[0] = MAX2(bounds_max[0], selection_max[0]);
+    selection_max[1] = MAX2(bounds_max[1], selection_max[1]);
 
     if (params->rotate) {
       if (island->aspect_y != 1.0f) {
@@ -414,6 +448,208 @@ void ED_uvedit_pack_islands_multi(const Scene *scene,
             island->faces, island->faces_len, 1.0f / island->aspect_y, island->cd_loop_uv_offset);
       }
 
+      bm_face_array_uv_rotate_fit_aabb(
+          island->faces, island->faces_len, rotate_align_axis, island->cd_loop_uv_offset);
+
+      if (island->aspect_y != 1.0f) {
+        bm_face_array_uv_scale_y(
+            island->faces, island->faces_len, island->aspect_y, island->cd_loop_uv_offset);
+      }
+    }
+
+    bm_face_array_calc_bounds(
+        island->faces, island->faces_len, island->cd_loop_uv_offset, &island->bounds_rect);
+
+    BoxPack *box = &boxarray[index];
+    box->index = index;
+    box->x = 0.0f;
+    box->y = 0.0f;
+    box->w = BLI_rctf_size_x(&island->bounds_rect);
+    box->h = BLI_rctf_size_y(&island->bounds_rect);
+
+    island_array[index] = island;
+
+    if (margin > 0.0f) {
+      area += (double)sqrtf(box->w * box->h);
+    }
+  }
+
+  /* Calculate the center of the bounding box */
+  selection_center[0] = (selection_min[0] + selection_max[0]) / 2.0f;
+  selection_center[1] = (selection_min[1] + selection_max[1]) / 2.0f;
+
+  if (margin > 0.0f) {
+    /* Logic matches behavior from #param_pack,
+     * use area so multiply the margin by the area to give
+     * predictable results not dependent on UV scale. */
+    margin = (margin * (float)area) * 0.1f;
+    for (int i = 0; i < island_list_len; i++) {
+      struct FaceIsland *island = island_array[i];
+      BoxPack *box = &boxarray[i];
+
+      BLI_rctf_pad(&island->bounds_rect, margin, margin);
+      box->w = BLI_rctf_size_x(&island->bounds_rect);
+      box->h = BLI_rctf_size_y(&island->bounds_rect);
+    }
+  }
+
+  float boxarray_size[2];
+  BLI_box_pack_2d(boxarray, island_list_len, &boxarray_size[0], &boxarray_size[1]);
+
+  /* Don't change the aspect when scaling. */
+  boxarray_size[0] = boxarray_size[1] = max_ff(boxarray_size[0], boxarray_size[1]);
+
+  const float scale[2] = {1.0f / boxarray_size[0], 1.0f / boxarray_size[1]};
+
+  /* Tile offset */
+  float base_offset[2] = {0.0f, 0.0f};
+
+  /* (sima = NULL) or (use_target = false) would skip the calculation of base_offset - Smart UV
+   * project */
+  if (use_target) {
+    const int specified_tile_index = scene->toolsettings->target_udim - 1001;
+    /* Calculate offset based on specified_tile_index */
+    base_offset[0] = specified_tile_index % 10;
+    base_offset[1] = specified_tile_index / 10;
+  }
+
+  /* If tiled image then constrain to correct/closest UDIM tile */
+  else if (sima && is_tiled_image && !use_target) {
+    int nearest_tile_index = BKE_image_find_nearest_tile(image, selection_center);
+    if (nearest_tile_index != -1) {
+      nearest_tile_index -= 1001;
+      /* Calculate offset based on nearest_tile_index */
+      base_offset[0] = nearest_tile_index % 10;
+      base_offset[1] = nearest_tile_index / 10;
+    }
+  }
+
+  /* If no image present then constrain to correct/closest tile on UDIM grid*/
+  else if (sima && !image && !use_target) {
+    const float co_floor[2] = {floorf(selection_center[0]), floorf(selection_center[1])};
+    if (selection_center[0] < udim_grid[0] && selection_center[0] > 0 &&
+        selection_center[1] < udim_grid[1] && selection_center[1] > 0) {
+      base_offset[0] = co_floor[0];
+      base_offset[1] = co_floor[1];
+    }
+    /* If Selected UVs lie outside the UDIM grid, constrain to closest tile on UDIM grid */
+    else {
+      if (selection_center[0] > udim_grid[0]) {
+        base_offset[0] = udim_grid[0] - 1;
+      }
+      else if (selection_center[0] < 0) {
+        base_offset[0] = 0;
+      }
+      else {
+        base_offset[0] = co_floor[0];
+      }
+
+      if (selection_center[1] > udim_grid[1]) {
+        base_offset[1] = udim_grid[1] - 1;
+      }
+      else if (selection_center[1] < 0) {
+        base_offset[1] = 0;
+      }
+      else {
+        base_offset[1] = co_floor[1];
+      }
+    }
+  }
+
+  for (int i = 0; i < island_list_len; i++) {
+    struct FaceIsland *island = island_array[boxarray[i].index];
+    const float pivot[2] = {
+        island->bounds_rect.xmin,
+        island->bounds_rect.ymin,
+    };
+    const float offset[2] = {
+        (boxarray[i].x * scale[0]) - island->bounds_rect.xmin + base_offset[0],
+        (boxarray[i].y * scale[1]) - island->bounds_rect.ymin + base_offset[1],
+    };
+    for (int j = 0; j < island->faces_len; j++) {
+      BMFace *efa = island->faces[j];
+      bm_face_uv_translate_and_scale_around_pivot(
+          efa, offset, scale, pivot, island->cd_loop_uv_offset);
+    }
+  }
+
+  for (uint ob_index = 0; ob_index < objects_len; ob_index++) {
+    Object *obedit = objects[ob_index];
+    DEG_id_tag_update(obedit->data, ID_RECALC_GEOMETRY);
+    WM_main_add_notifier(NC_GEOM | ND_DATA, obedit->data);
+  }
+
+  for (int i = 0; i < island_list_len; i++) {
+    MEM_freeN(island_array[i]->faces);
+    MEM_freeN(island_array[i]);
+  }
+
+  MEM_freeN(island_array);
+  MEM_freeN(boxarray);
+}
+
+/** \} */
+
+/* Almost similar to ED_uvedit_pack_islands_multi().
+ * TODO : Break some of the code into smaller functions since same operations are being done in
+ * both ED_uvedit_pack_islands_to_area_multi() and ED_uvedit_pack_islands_multi() */
+void ED_uvedit_pack_islands_to_area_multi(const Scene *scene,
+                                          Object **objects,
+                                          const uint objects_len,
+                                          const float min_co[2],
+                                          const float max_co[2],
+                                          const bool scale_islands,
+                                          const struct UVPackIsland_Params *params)
+{
+  /* Align to the Y axis, could make this configurable. */
+  const int rotate_align_axis = 1;
+  ListBase island_list = {NULL};
+  int island_list_len = 0;
+
+  for (uint ob_index = 0; ob_index < objects_len; ob_index++) {
+    Object *obedit = objects[ob_index];
+    BMEditMesh *em = BKE_editmesh_from_object(obedit);
+    BMesh *bm = em->bm;
+
+    const int cd_loop_uv_offset = CustomData_get_offset(&bm->ldata, CD_MLOOPUV);
+    if (cd_loop_uv_offset == -1) {
+      continue;
+    }
+
+    island_list_len += bm_mesh_calc_uv_islands(scene,
+                                               bm,
+                                               &island_list,
+                                               params->only_selected_faces,
+                                               params->only_selected_uvs,
+                                               params->use_seams,
+                                               1.0f,
+                                               cd_loop_uv_offset);
+  }
+
+  /* This check could probably be removed */
+  if (island_list_len == 0) {
+    return;
+  }
+
+  float margin = scene->toolsettings->uvcalc_margin;
+  double area = 0.0f;
+
+  struct FaceIsland **island_array = MEM_mallocN(sizeof(*island_array) * island_list_len,
+                                                 __func__);
+  BoxPack *boxarray = MEM_mallocN(sizeof(*boxarray) * island_list_len, __func__);
+
+  int index;
+  LISTBASE_FOREACH_INDEX (struct FaceIsland *, island, &island_list, index) {
+    /* For now using the same conditions for rotating islands when scaling is enabled and disabled.
+     * TODO : New heuristic for rotating islands when scaling is disabled (using the
+     * RectPack2D algorithm) */
+    if (params->rotate) {
+      if (island->aspect_y != 1.0f) {
+        bm_face_array_uv_scale_y(
+            island->faces, island->faces_len, 1.0f / island->aspect_y, island->cd_loop_uv_offset);
+      }
+
+      // AABB - Axis Aligned Bounding Box
       bm_face_array_uv_rotate_fit_aabb(
           island->faces, island->faces_len, rotate_align_axis, island->cd_loop_uv_offset);
 
@@ -455,13 +691,31 @@ void ED_uvedit_pack_islands_multi(const Scene *scene,
     }
   }
 
-  float boxarray_size[2];
-  BLI_box_pack_2d(boxarray, island_list_len, &boxarray_size[0], &boxarray_size[1]);
+  if (scale_islands) {
+    /* The problem statement for pack islands to box area operator is : Pack a given set of
+     * rectangular boxes to a rectangular area. Scaling down the width by W (width of rectangualr
+     * area) and height by H (height of rectangualr area) for all the boxes and the packing area,
+     * the new problem statement becomes : packing a set of rectangular boxes to a square area ->
+     * Similar to the original pack islands operator */
+    for (int i = 0; i < island_list_len; i++) {
+      boxarray[i].w /= (max_co[0] - min_co[0]);
+      boxarray[i].h /= (max_co[1] - min_co[1]);
+    }
+  }
+  float boxarray_size[2] = {0.0f, 0.0f};
+  float scale[2] = {1.0f, 1.0f};
 
-  /* Don't change the aspect when scaling. */
-  boxarray_size[0] = boxarray_size[1] = max_ff(boxarray_size[0], boxarray_size[1]);
-
-  const float scale[2] = {1.0f / boxarray_size[0], 1.0f / boxarray_size[1]};
+  /* If scaling is enabled then use the original pack islands algorithm, otherwise use the
+   * RectPack2D algorithm for packing */
+  if (scale_islands) {
+    BLI_box_pack_2d(boxarray, island_list_len, &boxarray_size[0], &boxarray_size[1]);
+    boxarray_size[0] = boxarray_size[1] = max_ff(boxarray_size[0], boxarray_size[1]);
+    scale[0] = 1.0f / boxarray_size[0];
+    scale[1] = 1.0f / boxarray_size[1];
+  }
+  else {
+    BLI_rect_pack_2d(boxarray, island_list_len, (max_co[0] - min_co[0]), (max_co[1] - min_co[1]));
+  }
 
   for (int i = 0; i < island_list_len; i++) {
     struct FaceIsland *island = island_array[boxarray[i].index];
@@ -469,10 +723,21 @@ void ED_uvedit_pack_islands_multi(const Scene *scene,
         island->bounds_rect.xmin,
         island->bounds_rect.ymin,
     };
-    const float offset[2] = {
-        (boxarray[i].x * scale[0]) - island->bounds_rect.xmin,
-        (boxarray[i].y * scale[1]) - island->bounds_rect.ymin,
-    };
+
+    float offset[2];
+    if (scale_islands) {
+      /* Scale boxes back to original dimensions and offset them to the position of the packing
+       * area */
+      offset[0] = (boxarray[i].x * scale[0] * (max_co[0] - min_co[0])) - island->bounds_rect.xmin +
+                  min_co[0];
+      offset[1] = (boxarray[i].y * scale[1] * (max_co[1] - min_co[1])) - island->bounds_rect.ymin +
+                  min_co[1];
+    }
+    else {
+      offset[0] = (boxarray[i].x) - island->bounds_rect.xmin + min_co[0];
+      offset[1] = (boxarray[i].y) - island->bounds_rect.ymin + min_co[1];
+    }
+
     for (int j = 0; j < island->faces_len; j++) {
       BMFace *efa = island->faces[j];
       bm_face_uv_translate_and_scale_around_pivot(
@@ -494,5 +759,3 @@ void ED_uvedit_pack_islands_multi(const Scene *scene,
   MEM_freeN(island_array);
   MEM_freeN(boxarray);
 }
-
-/** \} */
