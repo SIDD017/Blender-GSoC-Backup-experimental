@@ -34,6 +34,7 @@
 #include "DNA_scene_types.h"
 #include "DNA_screen_types.h"
 #include "DNA_space_types.h"
+#include "DNA_view2d_types.h"
 
 #include "PIL_time.h"
 
@@ -1047,5 +1048,71 @@ void draw_image_cache(const bContext *C, ARegion *region)
 
   if (mask != NULL) {
     ED_mask_draw_frames(mask, region, cfra, sfra, efra);
+  }
+}
+
+float ED_space_image_zoom_level(const View2D *v2d, const int grid_dimension)
+{
+  float xzoom = (v2d->cur.xmax - v2d->cur.xmin) / ((float)(v2d->mask.xmax - v2d->mask.xmin));
+  float yzoom = (v2d->cur.ymax - v2d->cur.ymin) / ((float)(v2d->mask.ymax - v2d->mask.ymin));
+  /* Calculating average of xzoom and yzoom for accuracy. Using only xzoom or yzoom would have
+   * been sufficient */
+  float zoom_factor = (xzoom + yzoom) / 2.0f;
+  /* grid begins to appear when the length of one grid unit is at least (N^2) pixels in the
+   * UV/Image editor for a (NxN grid) */
+  zoom_factor *= (grid_dimension * grid_dimension);
+  return zoom_factor;
+}
+
+void ED_space_image_grid_steps(const int grid_dimension,
+                               float grid_steps[8],
+                               const bool is_dynamic_grid)
+{
+  if (is_dynamic_grid) {
+    for (int step = 0; step < 8; step++) {
+      grid_steps[step] = powf(1, step) * (1.0f / ((float)grid_dimension));
+    }
+  }
+  else {
+    for (int step = 0; step < 8; step++) {
+      grid_steps[step] = powf(grid_dimension, step) * (1.0f / (powf(grid_dimension, 8)));
+    }
+  }
+}
+
+/* Calculate the increment snapping value for UV/image editor based on the zoom factor
+ * The code in here (except the offset part) is used in `grid_frag.glsl` (see `grid_res`) for
+ * drawing the grid overlay for the UV/Image editor */
+float ED_space_image_increment_snap_value(const float grid_steps[8], const float zoom_factor)
+{
+  /* Small offset on each grid_steps[] so that snapping value doesn't change until grid lines are
+   * significantly visible.
+   * Offset = 3/4 * (grid_steps[i] - grid_steps[i+1])
+   *
+   * Refer grid_frag.glsl to find out when grid lines actually start
+   * appearing */
+  if ((grid_steps[0] - ((9 * grid_steps[0]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[0];
+  }
+  else if ((grid_steps[1] - ((9 * grid_steps[1]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[1];
+  }
+  else if ((grid_steps[2] - ((9 * grid_steps[2]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[2];
+  }
+  else if ((grid_steps[3] - ((9 * grid_steps[3]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[3];
+  }
+  else if ((grid_steps[4] - ((9 * grid_steps[4]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[4];
+  }
+  else if ((grid_steps[5] - ((9 * grid_steps[5]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[5];
+  }
+  else if ((grid_steps[6] - ((9 * grid_steps[6]) / (4.0f * 4.0f))) > zoom_factor) {
+    return grid_steps[6];
+  }
+  else {
+    return grid_steps[7];
   }
 }

@@ -941,6 +941,10 @@ class IMAGE_PT_snapping(Panel):
             col.label(text="Target")
             row = col.row(align=True)
             row.prop(tool_settings, "snap_target", expand=True)
+            
+        col.separator()
+        if 'INCREMENT' in tool_settings.snap_uv_element:
+            col.prop(tool_settings, "use_snap_uv_grid_absolute")
 
         col.label(text="Affect")
         row = col.row(align=True)
@@ -1475,6 +1479,35 @@ class IMAGE_PT_udim_grid(Panel):
         col = layout.column()
         col.prop(uvedit, "tile_grid_shape", text="Grid Shape")
 
+class IMAGE_PT_dynamic_grid(Panel):
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "View"
+    bl_label = "Dynamic Grid"
+
+    @classmethod
+    def poll(cls, context):
+        sima = context.space_data
+        #Grid becomes irrelevant once an image is loaded in the UV Editor
+        return sima.show_uvedit and sima.image is None
+
+    #Not exposed in the Image editor and disabled by default
+    def draw_header(self, context):
+        sima = context.space_data
+        uvedit = sima.uv_editor
+        self.layout.prop(uvedit, "use_dynamic_grid", text="")
+    
+    def draw(self, context):
+        layout = self.layout
+
+        sima = context.space_data
+        uvedit = sima.uv_editor
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        col = layout.column()
+        col.prop(uvedit, "dynamic_grid_size", text="Grid Size")
 
 class IMAGE_PT_overlay(Panel):
     bl_space_type = 'IMAGE_EDITOR'
@@ -1660,6 +1693,7 @@ classes = (
     IMAGE_PT_uv_cursor,
     IMAGE_PT_annotation,
     IMAGE_PT_udim_grid,
+    IMAGE_PT_dynamic_grid,
     IMAGE_PT_overlay,
     IMAGE_PT_overlay_uv_edit,
     IMAGE_PT_overlay_uv_edit_geometry,

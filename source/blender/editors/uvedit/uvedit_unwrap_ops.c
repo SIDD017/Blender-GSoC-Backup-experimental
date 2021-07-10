@@ -1007,6 +1007,12 @@ static void uvedit_pack_islands_multi(const Scene *scene,
   }
 }
 
+/* Packing targets */
+enum {
+  CLOSEST_UDIM = 0,
+  SPECIFIED_UDIM = 1,
+};
+
 static int pack_islands_exec(bContext *C, wmOperator *op)
 {
   ViewLayer *view_layer = CTX_data_view_layer(C);
@@ -1028,7 +1034,7 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
   bool rotate = RNA_boolean_get(op->ptr, "rotate");
 
   /* Check if specified UDIM is valid - specified tile exists in the udim grid or tiled image */
-  if (RNA_enum_get(op->ptr, "packTo") == 1) {
+  if (RNA_enum_get(op->ptr, "packTo") == SPECIFIED_UDIM) {
     if (RNA_struct_property_is_set(op->ptr, "target_udim")) {
       int target_udim = RNA_int_get(op->ptr, "target_udim");
 
@@ -1037,7 +1043,6 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
         target_udim -= 1001;
         const int target_x = (target_udim % 10) + 1;
         const int target_y = (target_udim / 10) + 1;
-
         if (target_x <= sima->tile_grid_shape[0] && target_y <= sima->tile_grid_shape[1]) {
           scene->toolsettings->target_udim = RNA_int_get(op->ptr, "target_udim");
         }
@@ -1049,9 +1054,7 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
       /* If tiled image present then check if target_udim is valid */
       else if (image && is_tiled_image) {
         RNA_int_set(op->ptr, "target_udim", scene->toolsettings->target_udim);
-
         LISTBASE_FOREACH (const ImageTile *, tile, &image->tiles) {
-
           if (target_udim == tile->tile_number) {
             scene->toolsettings->target_udim = target_udim;
             RNA_int_set(op->ptr, "target_udim", target_udim);
@@ -1067,7 +1070,6 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
       }
     }
 
-    /*  */
     else {
       scene->toolsettings->target_udim = RNA_int_get(op->ptr, "target_udim");
     }
@@ -1108,7 +1110,6 @@ static int pack_islands_exec(bContext *C, wmOperator *op)
                                });
 
   MEM_freeN(objects);
-
   return OPERATOR_FINISHED;
 }
 
@@ -1122,8 +1123,9 @@ static void pack_islands_draw(bContext *C, wmOperator *op)
 
   col = uiLayoutColumn(layout, false);
 
+  /* Expose target UDIM prop only if packing target is specified UDIM */
   uiItemR(col, op->ptr, "packTo", 0, NULL, 0);
-  if (RNA_enum_get(op->ptr, "packTo") == 1) {
+  if (RNA_enum_get(op->ptr, "packTo") == SPECIFIED_UDIM) {
     uiItemR(col, op->ptr, "target_udim", 0, NULL, 0);
   }
 
@@ -1134,8 +1136,8 @@ static void pack_islands_draw(bContext *C, wmOperator *op)
 void UV_OT_pack_islands(wmOperatorType *ot)
 {
   static const EnumPropertyItem pack_to[] = {
-      {0, "CLOSEST_UDIM", 0, "Closest UDIM", "Pack islands to closest UDIM"},
-      {1, "SPECIFIED_UDIM", 0, "Specified UDIM", "Pack islands to specified UDIM"},
+      {CLOSEST_UDIM, "CLOSEST_UDIM", 0, "Closest UDIM", "Pack islands to closest UDIM"},
+      {SPECIFIED_UDIM, "SPECIFIED_UDIM", 0, "Specified UDIM", "Pack islands to specified UDIM"},
       {0, NULL, 0, NULL, NULL},
   };
   /* identifiers */
@@ -1151,7 +1153,7 @@ void UV_OT_pack_islands(wmOperatorType *ot)
   ot->ui = pack_islands_draw;
 
   /* properties */
-  RNA_def_enum(ot->srna, "packTo", pack_to, 0, "Pack to", "");
+  RNA_def_enum(ot->srna, "packTo", pack_to, CLOSEST_UDIM, "Pack to", "");
   RNA_def_boolean(ot->srna, "rotate", true, "Rotate", "Rotate islands for best fit");
   RNA_def_int(ot->srna,
               "target_udim",
@@ -1179,29 +1181,72 @@ static int pack_islands_to_area_exec(bContext *C, wmOperator *op)
   ARegion *region = CTX_wm_region(C);
 
   uint objects_len = 0;
-  /* Get reference to objects currently in edit mode */
   Object **objects = BKE_view_layer_array_from_objects_in_edit_mode_unique_data_with_uvs(
       view_layer, CTX_wm_view3d(C), &objects_len);
 
-  /* User-defined area for packing */
+  /* Packing area coordinates */
+  float box_min_co[2] = {0.0f, 0.0f};
+  float box_max_co[2] = {1.0f, 1.0f};
+  /* Store coordinates for operator rerun */
+  float pack_area[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+
   rctf bounds;
   WM_operator_properties_border_to_rctf(op, &bounds);
   UI_view2d_region_to_view_rctf(&region->v2d, &bounds, &bounds);
+  /* Bounding coordinates for the user-defined area */
+  box_min_co[0] = bounds.xmin;
+  box_min_co[1] = bounds.ymin;
+  box_max_co[0] = bounds.xmax;
+  box_max_co[1] = bounds.ymax;
 
-  /* Store the bounding coordinates for the user-defined area */
-  float min_co[2] = {bounds.xmin, bounds.ymin};
-  float max_co[2] = {bounds.xmax, bounds.ymax};
+  RNA_float_get_array(op->ptr, "pack_area", pack_area);
+
+  /* Running operator through modal callback */
+  if (!RNA_struct_property_is_set(op->ptr, "pack_area")) {
+    RNA_float_set_array(op->ptr, "box_min_co", box_min_co);
+    RNA_float_set_array(op->ptr, "box_max_co", box_max_co);
+
+    pack_area[0] = box_min_co[0];
+    pack_area[1] = box_min_co[1];
+    pack_area[2] = box_max_co[0];
+    pack_area[3] = box_max_co[1];
+
+    RNA_float_set_array(op->ptr, "pack_area", pack_area);
+    /* Scale always true when box select used to define area */
+    RNA_boolean_set(op->ptr, "scale", true);
+  }
+  /* Re-running operator theough properties panel */
+  else {
+    RNA_float_get_array(op->ptr, "box_min_co", box_min_co);
+    RNA_float_get_array(op->ptr, "box_max_co", box_max_co);
+    if ((box_max_co[0] - box_min_co[0]) <= 0.001f || (box_max_co[1] - box_min_co[1]) <= 0.001f) {
+      box_min_co[0] = pack_area[0];
+      box_min_co[1] = pack_area[1];
+      box_max_co[0] = pack_area[2];
+      box_max_co[1] = pack_area[3];
+      RNA_float_set_array(op->ptr, "box_min_co", box_min_co);
+      RNA_float_set_array(op->ptr, "box_max_co", box_max_co);
+      RNA_float_set_array(op->ptr, "pack_area", pack_area);
+      /* CANCEL OPERATOR SINCE INVALID COORDINATES WERE ENTERED */
+      MEM_freeN(objects);
+      return OPERATOR_CANCELLED;
+    }
+    else {
+      pack_area[0] = box_min_co[0];
+      pack_area[1] = box_min_co[1];
+      pack_area[2] = box_max_co[0];
+      pack_area[3] = box_max_co[1];
+      RNA_float_set_array(op->ptr, "pack_area", pack_area);
+    }
+  }
 
   /* Keeping a lower bound of 0.001 for user-defined space, smaller than that and the UVs won't be
    * visible in the UV editor
    * NOTE : Could be removed/changed */
-  if ((max_co[0] - min_co[0]) <= 0.001 || (max_co[1] - min_co[1]) <= 0.001) {
+  if ((box_max_co[0] - box_min_co[0]) <= 0.001f || (box_max_co[1] - box_min_co[1]) <= 0.001f) {
+    MEM_freeN(objects);
     return OPERATOR_CANCELLED;
   }
-
-  /* Check : packing area coordinates */
-  printf("Bottom-left coordinates : (%f,%f) \n", bounds.xmin, bounds.ymin);
-  printf("Top-right coordinates : (%f,%f) \n\n", bounds.xmax, bounds.ymax);
 
   /* RNA props */
   bool rotate_islands = RNA_boolean_get(op->ptr, "rotate");
@@ -1213,20 +1258,29 @@ static int pack_islands_to_area_exec(bContext *C, wmOperator *op)
     RNA_float_set(op->ptr, "margin", scene->toolsettings->uvcalc_margin);
   }
 
-  ED_uvedit_pack_islands_to_area_multi(scene,
-                                       objects,
-                                       objects_len,
-                                       min_co,
-                                       max_co,
-                                       scale_islands,
-                                       &(struct UVPackIsland_Params){
-                                           .rotate = rotate_islands,
-                                           .rotate_align_axis = -1,
-                                           .only_selected_uvs = true,
-                                           .only_selected_faces = true,
-                                           .correct_aspect = true,
-                                       });
-
+  /* Cancel operator in case packing area is not big enough to pack all selected islands */
+  if (!ED_uvedit_pack_islands_to_area_multi(scene,
+                                            objects,
+                                            objects_len,
+                                            box_min_co,
+                                            box_max_co,
+                                            scale_islands,
+                                            &(struct UVPackIsland_Params){
+                                                .rotate = rotate_islands,
+                                                .rotate_align_axis = -1,
+                                                .only_selected_uvs = true,
+                                                .only_selected_faces = true,
+                                                .correct_aspect = true,
+                                            })) {
+    /* Warning might be better than using error. Something similar to
+     * dyntopo_warning_popup() might be ideal in this case */
+    BKE_report(op->reports,
+               RPT_ERROR,
+               "Operator Cancelled. Packing area not big enough for selected islands");
+    RNA_boolean_set(op->ptr, "scale", true);
+    MEM_freeN(objects);
+    return OPERATOR_CANCELLED;
+  }
   MEM_freeN(objects);
   return OPERATOR_FINISHED;
 }
@@ -1275,16 +1329,54 @@ void UV_OT_pack_islands_to_area(wmOperatorType *ot)
   ot->cancel = WM_gesture_box_cancel;
 
   ot->poll = ED_operator_uvedit;
-  // ot->poll = ED_operator_uvedit_space_image;
 
   /* flags */
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
 
   /* RNA properties */
+  /* Max coordinates of the packing area */
+  static float default_max[2] = {1.0f, 1.0f};
+  RNA_def_float_vector(ot->srna,
+                       "box_max_co",
+                       2,
+                       default_max,
+                       -100.0f,
+                       100.0f,
+                       "Maximum",
+                       "Maximum coordinates for the packing area",
+                       -100.0f,
+                       100.0f);
+  /* Min coordinates of packing area */
+  static float default_min[2] = {0.0f, 0.0f};
+  RNA_def_float_vector(ot->srna,
+                       "box_min_co",
+                       2,
+                       default_min,
+                       -100.0f,
+                       100.0f,
+                       "Minimum",
+                       "Minimum coordinates for the packing area",
+                       -100.0f,
+                       100.0f);
   RNA_def_boolean(ot->srna, "rotate", true, "Rotate", "Rotate islands for best fit");
-  RNA_def_boolean(ot->srna, "scale", true, "Scale", "Scale islands for best fit");
+  RNA_def_boolean(ot->srna, "scale", true, "Scale", "Preserve island scale when packing");
   RNA_def_float_factor(
       ot->srna, "margin", 0.001f, 0.0f, 1.0f, "Margin", "Space between islands", 0.0f, 1.0f);
+
+  /* Store pack area coordinates for rerun from properties panel */
+  PropertyRNA *prop;
+  static float default_val[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  prop = RNA_def_float_array(ot->srna,
+                             "pack_area",
+                             4,
+                             default_val,
+                             INT_MIN,
+                             INT_MAX,
+                             "Packing area coordinates",
+                             "",
+                             INT_MIN,
+                             INT_MAX);
+  RNA_def_property_flag(prop, PROP_HIDDEN);
 
   WM_operator_properties_border(ot);
 }

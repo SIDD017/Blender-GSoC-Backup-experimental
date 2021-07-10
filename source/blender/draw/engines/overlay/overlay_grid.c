@@ -23,6 +23,7 @@
 #include "DRW_render.h"
 
 #include "DNA_camera_types.h"
+#include "DNA_screen_types.h"
 
 #include "DEG_depsgraph_query.h"
 
@@ -46,6 +47,7 @@ enum {
   GRID_BACK = (1 << 9),
   GRID_CAMERA = (1 << 10),
   PLANE_IMAGE = (1 << 11),
+  DYNAMIC_GRID = (1 << 12),
 };
 
 void OVERLAY_grid_init(OVERLAY_Data *vedata)
@@ -61,12 +63,25 @@ void OVERLAY_grid_init(OVERLAY_Data *vedata)
 
   if (pd->space_type == SPACE_IMAGE) {
     SpaceImage *sima = (SpaceImage *)draw_ctx->space_data;
+    View2D *v2d = &draw_ctx->region->v2d;
+
     shd->grid_flag = ED_space_image_has_buffer(sima) ? 0 : PLANE_IMAGE | SHOW_GRID;
     shd->grid_distance = 1.0f;
     copy_v3_fl3(
         shd->grid_size, (float)sima->tile_grid_shape[0], (float)sima->tile_grid_shape[1], 1.0f);
-    for (int step = 0; step < 8; step++) {
-      shd->grid_steps[step] = powf(4, step) * (1.0f / 16.0f);
+
+    /* For a NxN grid. Keep insync with value in initSnapSpatial() inside transform.c */
+    int N = 4;
+    shd->zoom_factor = ED_space_image_zoom_level(v2d, N);
+
+    if (sima->flag & SI_DYNAMIC_GRID) {
+      shd->grid_flag |= DYNAMIC_GRID;
+      /* Temporary fix : dynamic_grid_size is not using the default value (=1) assignd in RNA */
+      sima->dynamic_grid_size = (sima->dynamic_grid_size == 0) ? 1 : sima->dynamic_grid_size;
+      ED_space_image_grid_steps(sima->dynamic_grid_size, shd->grid_steps, true);
+    }
+    else {
+      ED_space_image_grid_steps(N, shd->grid_steps, false);
     }
     return;
   }
@@ -238,6 +253,7 @@ void OVERLAY_grid_cache_init(OVERLAY_Data *vedata)
 
   grp = DRW_shgroup_create(sh, psl->grid_ps);
   DRW_shgroup_uniform_int(grp, "gridFlag", &shd->grid_flag, 1);
+  DRW_shgroup_uniform_float_copy(grp, "zoomFactor", shd->zoom_factor);
   DRW_shgroup_uniform_vec3(grp, "planeAxes", shd->grid_axes, 1);
   DRW_shgroup_uniform_block(grp, "globalsBlock", G_draw.block_ubo);
   DRW_shgroup_uniform_texture_ref(grp, "depthBuffer", &dtxl->depth);
